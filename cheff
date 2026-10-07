@@ -1,0 +1,235 @@
+// silent_aim.hpp
+#pragma once
+#include <cstdint>
+#include <cmath>
+#include <optional>
+
+struct Vec3 {
+    float x, y, z;
+    Vec3& operator-=(const Vec3& o) { x -= o.x; y -= o.y; z -= o.z; return *this; }
+    Vec3 operator-(const Vec3& o) const { return {x-o.x, y-o.y, z-o.z}; }
+    float Length2D() const { return std::hypot(x, y); }
+    float Length() const { return std::hypot(x, std::hypot(y, z)); }
+    Vec3 Normalized() const {
+        float len = Length();
+        return len > 0.f ? Vec3{x/len, y/len, z/len} : Vec3{0,0,0};
+    }
+};
+
+struct QAngle {
+    float pitch, yaw, roll;
+};
+
+class IVEngineClient {
+public:
+    virtual void GetViewAngles(QAngle& va) = 0;
+    virtual void SetViewAngles(const QAngle& va) = 0;
+    virtual int GetLocalPlayer() = 0;
+};
+
+class IClientEntityList {
+public:
+    virtual void* GetClientEntity(int idx) = 0;
+    virtual void* GetClientEntityFromHandle(uintptr_t h) = 0;
+    virtual int GetHighestEntityIndex() = 0;
+};
+
+class CBaseEntity {
+public:
+    virtual const Vec3& GetAbsOrigin() = 0;
+    virtual const Vec3& GetEyePosition() = 0;
+    virtual int GetTeamNum() = 0;
+    virtual bool IsDormant() = 0;
+    virtual int GetHealth() = 0;
+    virtual uintptr_t GetBoneMatrix() = 0; // 0x26A8 offset typical
+};
+
+namespace Config {
+    inline float fov = 3.5f;
+    inline float smooth = 1.f; // 1 = instant
+    inline int hitbox = 8;     // head
+    inline bool rcs = true;
+    inline bool silent = true; // true = silent, false = pSilent
+}
+
+namespace Math {
+    inline void VectorAngles(const Vec3& forward, QAngle& angles) {
+        if (forward.x == 0.f && forward.y == 0.f) {
+            angles.pitch = forward.z > 0.f ? -90.f : 90.f;
+            angles.yaw = 0.f;
+        } else {
+            angles.pitch = -std::atan2(forward.z, forward.Length2D()) * 180.f / M_PI;
+            angles.yaw = std::atan2(forward.y, forward.x) * 180.f / M_PI;
+        }
+        angles.roll = 0.f;
+    }
+
+    inline void ClampAngles(QAngle& a) {
+        a.pitch = std::clamp(a.pitch, -89.f, 89.f);
+        a.yaw = std::fmod(a.yaw + 180.f, 360.f) - 180.f;
+        a.roll = 0.f;
+    }
+
+    inline float GetFov(const QAngle& view, const QAngle& aim) {
+        Vec3 v, a;
+        v.x = std::cos(view.yaw * M_PI/180) * std::cos(view.pitch * M_PI/180);
+        v.y = std::sin(view.yaw * M_PI/180) * std::cos(view.pitch * M_PI/180);
+        v.z = std::sin(view.pitch * M_PI/180);
+        a.x = std::cos(aim.yaw * M_PI/180) * std::cos(aim.pitch * M_PI/180);
+        a.y = std::sin(aim.yaw * M_PI/180) * std::cos(aim.pitch * M_PI/180);
+        a.z = std::sin(aim.pitch * M_PI/180);
+        return std::acos(std::clamp(v.x*a.x + v.y*a.y + v.z*a.z, -1.f, 1.f)) * 180.f / M_PI;
+    }
+
+    inline void SmoothAngle(QAngle& from, const QAngle& to, float factor) {
+        QAngle delta = {to.pitch - from.pitch, to.yaw - from.yaw, 0};
+        if (delta.pitch > 89.f) delta.pitch -= 180.f;
+        if (delta.pitch < -89.f) delta.pitch += 180.f;
+        if (delta.yaw > 180.f) delta.yaw -= 360.f;
+        if (delta.yaw < -180.f) delta.yaw += 360.f;
+        from.pitch += delta.pitch / factor;
+        from.yaw += delta.yaw / factor;
+        ClampAngles(from);
+    }
+}
+
+struct Target {
+    CBaseEntity* ent = nullptr;
+    Vec3 pos;
+    float fov = FLT_MAX;
+};
+
+class SilentAim {
+    IVEngineClient* engine = nullptr;
+    IClientEntityList* entlist = nullptr;
+    CBaseEntity* local = nullptr;
+    QAngle original_view{};
+    QAngle punch_old{};
+
+public:
+    void Init(IVEngineClient* eng, IClientEntityList* ent) {
+        engine = eng; entlist = ent;
+    }
+
+    void Run(void* cmd) {
+        if (!engine || !entlist) return;
+
+        local = static_cast<CBaseEntity*>(entlist->GetClientEntity(engine->GetLocalPlayer()));
+        if (!local || local->GetHealth() <= 0) return;
+
+        engine->GetViewAngles(original_view);
+
+        if (Config::rcs) {
+            // punch offset at 0x3030 typically
+            Vec3* punch = reinterpret_cast<Vec3*>(reinterpret_cast<uintptr_t>(local) + 0x3030);
+            original_view.pitch += punch->x * 2.f;
+            original_view.yaw -= punch->y * 2.f;
+            Math::ClampAngles(original_view);
+        }
+
+        auto target = FindBestTarget();
+        if (!target) return;
+
+        Vec3 eye = local->GetEyePosition();
+        Vec3 delta = target->pos - eye;
+        QAngle aim_angles{};
+        Math::VectorAngles(delta, aim_angles);
+        Math::ClampAngles(aim_angles);
+
+        float cur_fov = Math::GetFov(original_view, aim_angles);
+        if (cur_fov > Config::fov) return;
+
+        QAngle final_angles = aim_angles;
+        if (Config::smooth > 1.f) {
+            Math::SmoothAngle(original_view, aim_angles, Config::smooth);
+            final_angles = original_view;
+        }
+
+        if (Config::silent) {
+            // silent: only modify cmd->viewangles, not engine view
+            auto ucmd = static_cast<UserCmd*>(cmd);
+            ucmd->viewangles = final_angles;
+            // fix movement
+            CorrectMovement(ucmd, original_view);
+        } else {
+            // pSilent: set engine angles for one frame
+            engine->SetViewAngles(final_angles);
+        }
+    }
+
+private:
+    struct UserCmd {
+        int command_number;
+        int tick_count;
+        QAngle viewangles;
+        Vec3 aimdirection;
+        float forwardmove, sidemove, upmove;
+        int buttons;
+        char impulse;
+        int weaponselect, weaponsubtype;
+        int random_seed;
+        short mousedx, mousedy;
+        bool hasbeenpredicted;
+    };
+
+    std::optional<Target> FindBestTarget() {
+        Target best{};
+        Vec3 local_eye = local->GetEyePosition();
+        int local_team = local->GetTeamNum();
+
+        for (int i = 1; i <= entlist->GetHighestEntityIndex(); ++i) {
+            CBaseEntity* ent = static_cast<CBaseEntity*>(entlist->GetClientEntity(i));
+            if (!ent || ent == local || ent->GetHealth() <= 0 || ent->IsDormant()) continue;
+            if (ent->GetTeamNum() == local_team) continue;
+
+            uintptr_t bone_base = ent->GetBoneMatrix();
+            if (!bone_base) continue;
+            // bone 8 = head, 3 = neck, 4/5 = spine
+            Vec3* bone = reinterpret_cast<Vec3*>(bone_base + Config::hitbox * 0x30);
+            Vec3 pos = *bone;
+
+            Vec3 delta = pos - local_eye;
+            QAngle aim{};
+            Math::VectorAngles(delta, aim);
+            float f = Math::GetFov(original_view, aim);
+            if (f < best.fov) {
+                best = {ent, pos, f};
+            }
+        }
+        return best.ent ? std::optional<Target>(best) : std::nullopt;
+    }
+
+    void CorrectMovement(UserCmd* cmd, const QAngle& old_angles) {
+        float yaw_delta = cmd->viewangles.yaw - old_angles.yaw;
+        if (yaw_delta > 180.f) yaw_delta -= 360.f;
+        if (yaw_delta < -180.f) yaw_delta += 360.f;
+
+        float cos_d = std::cos(yaw_delta * M_PI / 180.f);
+        float sin_d = std::sin(yaw_delta * M_PI / 180.f);
+
+        float new_fwd = cos_d * cmd->forwardmove - sin_d * cmd->sidemove;
+        float new_side = sin_d * cmd->forwardmove + cos_d * cmd->sidemove;
+
+        cmd->forwardmove = new_fwd;
+        cmd->sidemove = new_side;
+    }
+};
+
+// hook entry — VMT index 22 for CreateMove in ClientMode
+using CreateMoveFn = bool(__thiscall*)(void*, float, UserCmd*);
+CreateMoveFn oCreateMove = nullptr;
+
+bool __fastcall hkCreateMove(void* ecx, void* edx, float flInputSampleTime, UserCmd* cmd) {
+    if (!cmd || cmd->command_number == 0) return oCreateMove(ecx, flInputSampleTime, cmd);
+
+    static SilentAim aim;
+    static bool inited = false;
+    if (!inited) {
+        // resolve interfaces via CreateInterface or pattern scan
+        // engine = ...; entlist = ...; aim.Init(engine, entlist);
+        inited = true;
+    }
+
+    aim.Run(cmd);
+    return false; // we set cmd->viewangles ourselves, skip original
+}
